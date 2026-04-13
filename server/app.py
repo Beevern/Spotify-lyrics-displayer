@@ -13,7 +13,7 @@ Required environment variables (set in .env or hosting dashboard):
 
 Run locally:
   pip install -r requirements.txt
-  uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+  python -m uvicorn app:app --host 127.0.0.1 --port 8000 --reload
 
 Deploy (Railway / Render / Fly.io):
   - Set the three env vars above in the hosting dashboard
@@ -26,6 +26,9 @@ import sqlite3
 from pathlib import Path
 from urllib.parse import urlencode
 from contextlib import asynccontextmanager
+
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).parent / '.env')
 
 import httpx
 from fastapi import FastAPI, Request
