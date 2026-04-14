@@ -1,6 +1,3 @@
+server\.env
 config.py
-server/.env
 .spotify_cache
-server/tokens.db
-__pycache__/
-*.pyc

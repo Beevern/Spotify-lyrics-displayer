@@ -21,6 +21,11 @@ import time
 import re
 import os
 import sys
+import socket
+
+# Give ALL network calls (including Spotipy's OAuth token-refresh which has no
+# built-in timeout) a 15-second ceiling so the poll thread can never hang forever.
+socket.setdefaulttimeout(15)
 
 try:
     import spotipy
@@ -46,7 +51,7 @@ REDIRECT_URI  = 'http://127.0.0.1:8888/callback'
 SCOPE         = ('user-read-currently-playing '
                  'user-read-playback-state '
                  'user-modify-playback-state')
-POLL_INTERVAL = 0.5
+POLL_INTERVAL = 2
 
 
 # ── LRC Parser ────────────────────────────────────────────────────────────────
@@ -208,7 +213,7 @@ class LyricsOverlay:
         self.lf.pack(fill='both', expand=True, padx=14, pady=(8, 6))
 
         self.cur_lbl = tk.Label(
-            self.lf, text='Waiting for Spotify…',
+            self.lf, text='Connecting to Spotify…',
             bg=self.BG, fg=self.CUR_FG,
             font=self.FONT,
             anchor='center', justify='center', wraplength=660)
@@ -285,15 +290,18 @@ class LyricsOverlay:
     # ── Spotify ───────────────────────────────────────────────────────────────
     def _init_spotify(self):
         try:
-            self.sp = spotipy.Spotify(auth_manager=SpotifyOAuth(
-                client_id=CLIENT_ID,
-                client_secret=CLIENT_SECRET,
-                redirect_uri=REDIRECT_URI,
-                scope=SCOPE,
-                open_browser=True,
-                cache_path=os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                        '.spotify_cache')
-            ))
+            self.sp = spotipy.Spotify(
+                auth_manager=SpotifyOAuth(
+                    client_id=CLIENT_ID,
+                    client_secret=CLIENT_SECRET,
+                    redirect_uri=REDIRECT_URI,
+                    scope=SCOPE,
+                    open_browser=True,
+                    cache_path=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                            '.spotify_cache')
+                ),
+                requests_timeout=10,
+            )
         except Exception as exc:
             self.sp = None
             self._set_display(f'Auth error: {exc}', '')
@@ -331,37 +339,62 @@ class LyricsOverlay:
     def _poll(self):
         while True:
             try:
-                if self.sp:
-                    pb = self.sp.current_playback()
-                    if pb and pb.get('item'):
-                        track  = pb['item']
-                        tid    = track['id']
-                        pos    = pb.get('progress_ms', 0)
-                        name   = track['name']
-                        artist = track['artists'][0]['name']
-                        self._is_playing = pb.get('is_playing', False)
+                if not self.sp:
+                    self.root.after(0, self._set_display,
+                                    '⚠  Not connected', 'Restart to retry')
+                    time.sleep(5)
+                    continue
 
-                        if tid != self.current_track_id:
-                            self.current_track_id = tid
-                            self.lyrics = []
-                            self.root.after(0, self.track_lbl.config,
-                                            {'text': f'♫  {name}  —  {artist}'})
-                            self.lyrics = self._fetch_lyrics(
-                                name, artist, track['duration_ms'])
+                pb = self.sp.current_playback()
+                if pb and pb.get('item'):
+                    track  = pb['item']
+                    tid    = track['id']
+                    pos    = pb.get('progress_ms', 0)
+                    name   = track['name']
+                    artists = track.get('artists') or []
+                    artist  = artists[0]['name'] if artists else track.get('show', {}).get('name', '')
+                    self._is_playing = pb.get('is_playing', False)
 
-                        if not self._is_playing:
-                            self.root.after(0, self._set_display, '⏸  Paused', '')
-                        elif self.lyrics:
-                            i   = self._line_index(self.lyrics, pos)
-                            cur = self.lyrics[i][1]
-                            nxt = self.lyrics[i + 1][1] if i + 1 < len(self.lyrics) else ''
-                            self.root.after(0, self._set_display, cur, nxt)
-                        else:
-                            self.root.after(0, self._set_display,
-                                            f'♫  {name}',
-                                            f'by {artist}   (lyrics not found)')
+                    if tid != self.current_track_id:
+                        self.current_track_id = tid
+                        self.lyrics = []
+                        self.root.after(0, self.track_lbl.config,
+                                        {'text': f'♫  {name}  —  {artist}'})
+                        self.root.after(0, self._set_display,
+                                        f'♫  {name}', f'by {artist}')
+                        self.lyrics = self._fetch_lyrics(
+                            name, artist, track['duration_ms'])
+
+                    if not self._is_playing:
+                        self.root.after(0, self._set_display, '⏸  Paused', '')
+                    elif self.lyrics:
+                        i   = self._line_index(self.lyrics, pos)
+                        cur = self.lyrics[i][1]
+                        nxt = self.lyrics[i + 1][1] if i + 1 < len(self.lyrics) else ''
+                        self.root.after(0, self._set_display, cur, nxt)
                     else:
-                        self.root.after(0, self._set_display, '♫  Nothing playing', '')
+                        self.root.after(0, self._set_display,
+                                        f'♫  {name}',
+                                        f'by {artist}   (lyrics not found)')
+                else:
+                    self.root.after(0, self._set_display, '♫  Nothing playing', '')
+            except spotipy.SpotifyException as exc:
+                if exc.http_status == 429:
+                    # Extract Retry-After from the message Spotipy formats
+                    import re as _re
+                    m = _re.search(r'[Rr]etry.{0,10}?(\d+)', str(exc))
+                    wait = int(m.group(1)) if m else 60
+                    wait = min(wait, 300)   # never sleep > 5 min per cycle
+                    print(f'[poll] rate-limited — waiting {wait}s')
+                    self.root.after(0, self._set_display,
+                                    '⏳  Rate limited by Spotify',
+                                    f'Retrying in {wait}s — slow down polling')
+                    time.sleep(wait)
+                else:
+                    print(f'[poll] {exc}')
+                    self.root.after(0, self._set_display, '⚠  Error', str(exc)[:70])
+                    time.sleep(4)
+                continue
             except Exception as exc:
                 print(f'[poll] {exc}')
                 self.root.after(0, self._set_display, '⚠  Error', str(exc)[:70])
