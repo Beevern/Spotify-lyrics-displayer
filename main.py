@@ -151,11 +151,15 @@ class LyricsOverlay:
 
         self.current_track_id: str | None = None
         self.lyrics: list[tuple[int, str]] = []
-        self._is_playing  = False
-        self._collapsed   = False
-        self._prev_height = 130
+        self._is_playing    = False
+        self._collapsed     = False
+        self._prev_height   = 130
         self._drag_ox = self._drag_oy = 0
         self._rsz: tuple | None = None
+        self._last_pos_ms   = 0
+        self._last_pos_time = 0.0
+        # When set, _tick() shows this instead of computing from lyrics
+        self._override_display: tuple | None = ('Connecting to Spotify…', '')
 
         self._build_ui()
         self._init_spotify()
@@ -340,12 +344,12 @@ class LyricsOverlay:
         while True:
             try:
                 if not self.sp:
-                    self.root.after(0, self._set_display,
-                                    '⚠  Not connected', 'Restart to retry')
+                    self._override_display = ('⚠  Not connected', 'Restart to retry')
                     time.sleep(5)
                     continue
 
                 pb = self.sp.current_playback()
+                fetch_time = time.time()   # timestamp matching progress_ms below
                 if pb and pb.get('item'):
                     track  = pb['item']
                     tid    = track['id']
@@ -360,24 +364,24 @@ class LyricsOverlay:
                         self.lyrics = []
                         self.root.after(0, self.track_lbl.config,
                                         {'text': f'♫  {name}  —  {artist}'})
-                        self.root.after(0, self._set_display,
-                                        f'♫  {name}', f'by {artist}')
+                        self._override_display = (f'♫  {name}', f'by {artist}')
                         self.lyrics = self._fetch_lyrics(
                             name, artist, track['duration_ms'])
 
                     if not self._is_playing:
-                        self.root.after(0, self._set_display, '⏸  Paused', '')
+                        self._override_display = ('⏸  Paused', '')
                     elif self.lyrics:
-                        i   = self._line_index(self.lyrics, pos)
-                        cur = self.lyrics[i][1]
-                        nxt = self.lyrics[i + 1][1] if i + 1 < len(self.lyrics) else ''
-                        self.root.after(0, self._set_display, cur, nxt)
+                        # Hand off to _tick() which interpolates in real time.
+                        # fetch_time is when Spotify gave us pos, so elapsed
+                        # time since then (including _fetch_lyrics) is correct.
+                        self._last_pos_ms   = pos
+                        self._last_pos_time = fetch_time
+                        self._override_display = None
                     else:
-                        self.root.after(0, self._set_display,
-                                        f'♫  {name}',
-                                        f'by {artist}   (lyrics not found)')
+                        self._override_display = (f'♫  {name}',
+                                                  f'by {artist}   (lyrics not found)')
                 else:
-                    self.root.after(0, self._set_display, '♫  Nothing playing', '')
+                    self._override_display = ('♫  Nothing playing', '')
             except spotipy.SpotifyException as exc:
                 if exc.http_status == 429:
                     # Extract Retry-After from the message Spotipy formats
@@ -386,25 +390,39 @@ class LyricsOverlay:
                     wait = int(m.group(1)) if m else 60
                     wait = min(wait, 300)   # never sleep > 5 min per cycle
                     print(f'[poll] rate-limited — waiting {wait}s')
-                    self.root.after(0, self._set_display,
-                                    '⏳  Rate limited by Spotify',
-                                    f'Retrying in {wait}s — slow down polling')
+                    self._override_display = ('⏳  Rate limited by Spotify',
+                                              f'Retrying in {wait}s — slow down polling')
                     time.sleep(wait)
                 else:
                     print(f'[poll] {exc}')
-                    self.root.after(0, self._set_display, '⚠  Error', str(exc)[:70])
+                    self._override_display = ('⚠  Error', str(exc)[:70])
                     time.sleep(4)
                 continue
             except Exception as exc:
                 print(f'[poll] {exc}')
-                self.root.after(0, self._set_display, '⚠  Error', str(exc)[:70])
+                self._override_display = ('⚠  Error', str(exc)[:70])
                 time.sleep(4)
                 continue
 
             time.sleep(POLL_INTERVAL)
 
+    def _tick(self):
+        """Runs every 250 ms on the UI thread. Interpolates playback position
+        so lyric changes are smooth regardless of the 2-second poll interval."""
+        if self._override_display is not None:
+            self._set_display(*self._override_display)
+        elif self.lyrics and self._last_pos_time and self._is_playing:
+            elapsed_ms = (time.time() - self._last_pos_time) * 1000
+            pos = int(self._last_pos_ms + elapsed_ms)
+            i   = self._line_index(self.lyrics, pos)
+            cur = self.lyrics[i][1]
+            nxt = self.lyrics[i + 1][1] if i + 1 < len(self.lyrics) else ''
+            self._set_display(cur, nxt)
+        self.root.after(250, self._tick)
+
     def _start_poll(self):
         threading.Thread(target=self._poll, daemon=True).start()
+        self.root.after(250, self._tick)
 
     def _set_display(self, current: str, nxt: str):
         self.cur_lbl.config(text=current)
